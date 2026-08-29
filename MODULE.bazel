@@ -130,6 +130,7 @@ osx.frameworks(names = [
     "UniformTypeIdentifiers",
     "VideoToolbox",
 ])
+osx.libraries(names = ["libbsm"])
 use_repo(osx, "macos_sdk")
 
 # Needed to disable xcode...

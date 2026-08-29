@@ -2,6 +2,7 @@ mod file_system_handler;
 mod handler;
 mod process_handler;
 mod processor;
+mod rb_managed;
 mod registry;
 mod request_dispatcher;
 mod session_registry;
@@ -9,6 +10,8 @@ mod transport;
 
 pub(crate) use handler::ExecServerHandler;
 pub(crate) use processor::ConnectionProcessor;
+pub use rb_managed::RbManagedConfigError;
+pub use rb_managed::RbManagedServerConfig;
 pub use request_dispatcher::ConcurrentRequestLimit;
 pub use request_dispatcher::RequestDispatchMode;
 pub use transport::DEFAULT_LISTEN_URL;
@@ -47,6 +50,29 @@ pub async fn run_main_with_telemetry(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     transport::run_transport(
         listen_url,
+        runtime_paths,
+        telemetry,
+        http_client_factory,
+        request_dispatch_mode,
+    )
+    .await
+}
+
+/// Runs the ResearchBuddy managed protocol over one inherited stdio connection.
+///
+/// Unlike [`run_main_with_telemetry`], this entrypoint has no listener or
+/// WebSocket selection surface. Its compile-time router exposes only the
+/// initialization/status methods until the filesystem helper and pathname
+/// confinement gates are proven.
+pub async fn run_rb_managed_stdio(
+    config: RbManagedServerConfig,
+    runtime_paths: ExecServerRuntimePaths,
+    telemetry: ExecServerTelemetry,
+    http_client_factory: HttpClientFactory,
+    request_dispatch_mode: RequestDispatchMode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    transport::run_rb_managed_stdio(
+        config,
         runtime_paths,
         telemetry,
         http_client_factory,

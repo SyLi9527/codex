@@ -17,6 +17,8 @@ use crate::rpc::encode_server_message;
 use crate::rpc_server_requests::RpcServerRequestSender;
 use crate::server::ExecServerHandler;
 use crate::server::RequestDispatchMode;
+use crate::server::rb_managed::RbManagedServerConfig;
+use crate::server::rb_managed::ServerProtocol;
 use crate::server::registry::build_router;
 use crate::server::request_dispatcher::RequestDispatcher;
 use crate::server::request_dispatcher::RequestTaskResult;
@@ -32,6 +34,16 @@ pub(crate) struct ConnectionProcessor {
     telemetry: ExecServerTelemetry,
     http_client_factory: HttpClientFactory,
     request_dispatch_mode: RequestDispatchMode,
+    protocol: ServerProtocol,
+}
+
+#[derive(Clone)]
+struct RunConnectionContext {
+    session_registry: Arc<SessionRegistry>,
+    runtime_paths: ExecServerRuntimePaths,
+    telemetry: ExecServerTelemetry,
+    http_client_factory: HttpClientFactory,
+    protocol: ServerProtocol,
 }
 
 impl ConnectionProcessor {
@@ -59,6 +71,24 @@ impl ConnectionProcessor {
             telemetry,
             http_client_factory,
             request_dispatch_mode,
+            protocol: ServerProtocol::Standard,
+        }
+    }
+
+    pub(crate) fn new_rb_managed(
+        config: RbManagedServerConfig,
+        runtime_paths: ExecServerRuntimePaths,
+        telemetry: ExecServerTelemetry,
+        http_client_factory: HttpClientFactory,
+        request_dispatch_mode: RequestDispatchMode,
+    ) -> Self {
+        Self {
+            session_registry: SessionRegistry::new(telemetry.clone()),
+            runtime_paths,
+            telemetry,
+            http_client_factory,
+            request_dispatch_mode,
+            protocol: ServerProtocol::RbManaged(config),
         }
     }
 
@@ -69,10 +99,13 @@ impl ConnectionProcessor {
     ) {
         run_connection(
             connection,
-            Arc::clone(&self.session_registry),
-            self.runtime_paths.clone(),
-            self.telemetry.clone(),
-            self.http_client_factory.clone(),
+            RunConnectionContext {
+                session_registry: Arc::clone(&self.session_registry),
+                runtime_paths: self.runtime_paths.clone(),
+                telemetry: self.telemetry.clone(),
+                http_client_factory: self.http_client_factory.clone(),
+                protocol: self.protocol.clone(),
+            },
             transport,
             self.request_dispatch_mode,
         )
@@ -86,13 +119,17 @@ impl ConnectionProcessor {
 
 async fn run_connection(
     connection: JsonRpcConnection,
-    session_registry: Arc<SessionRegistry>,
-    runtime_paths: ExecServerRuntimePaths,
-    telemetry: ExecServerTelemetry,
-    http_client_factory: HttpClientFactory,
+    context: RunConnectionContext,
     transport: ConnectionTransport,
     request_dispatch_mode: RequestDispatchMode,
 ) {
+    let RunConnectionContext {
+        session_registry,
+        runtime_paths,
+        telemetry,
+        http_client_factory,
+        protocol,
+    } = context;
     let _connection_metrics = telemetry.connection_started(transport);
     let JsonRpcConnection {
         outgoing_tx: json_outgoing_tx,
@@ -128,7 +165,7 @@ async fn run_connection(
     });
 
     let mut dispatcher = RequestDispatcher::new(
-        Arc::new(build_router()),
+        Arc::new(build_router(&protocol)),
         Arc::clone(&handler),
         outgoing_tx.clone(),
         disconnected_rx.clone(),
@@ -295,6 +332,8 @@ mod tests {
     use crate::rpc::RpcServerOutboundMessage;
     use crate::rpc_server_requests::RpcServerRequestSender;
     use crate::server::RequestDispatchMode;
+    use crate::server::processor::RunConnectionContext;
+    use crate::server::rb_managed::ServerProtocol;
     use crate::server::session_registry::SessionRegistry;
 
     #[tokio::test]
@@ -491,12 +530,15 @@ mod tests {
             JsonRpcConnection::from_stdio(server_reader, server_writer, label.to_string());
         let task = tokio::spawn(run_connection(
             connection,
-            registry,
-            test_runtime_paths(),
-            crate::ExecServerTelemetry::default(),
-            codex_http_client::HttpClientFactory::new(
-                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
-            ),
+            RunConnectionContext {
+                session_registry: registry,
+                runtime_paths: test_runtime_paths(),
+                telemetry: crate::ExecServerTelemetry::default(),
+                http_client_factory: codex_http_client::HttpClientFactory::new(
+                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+                ),
+                protocol: ServerProtocol::Standard,
+            },
             crate::telemetry::ConnectionTransport::Stdio,
             RequestDispatchMode::Inline,
         ));

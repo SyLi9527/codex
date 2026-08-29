@@ -1,0 +1,6 @@
+load("//:defs.bzl", "codex_rust_crate")
+
+codex_rust_crate(
+    name = "bounded-lines",
+    crate_name = "codex_utils_bounded_lines",
+)

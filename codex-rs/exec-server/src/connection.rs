@@ -10,6 +10,8 @@ use axum::extract::ws::Message as AxumWebSocketMessage;
 use axum::extract::ws::WebSocket as AxumWebSocket;
 use codex_exec_server_protocol::JSONRPCMessage;
 use codex_exec_server_protocol::JSONRPCRequest;
+use codex_utils_bounded_lines::BoundedLineError;
+use codex_utils_bounded_lines::read_bounded_utf8_payload_line_async;
 use futures::Sink;
 use futures::SinkExt;
 use futures::Stream;
@@ -26,8 +28,6 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::debug;
 use tracing::warn;
 
-use tokio::io::AsyncBufReadExt;
-use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::io::BufWriter;
@@ -306,18 +306,13 @@ impl JsonRpcConnection {
         let reader_label = connection_label.clone();
         let incoming_tx_for_reader = incoming_tx.clone();
         let disconnected_tx_for_reader = disconnected_tx.clone();
-        // Read one byte past the payload limit so an unterminated oversized
-        // message fails promptly. A trailing CR gets one more byte of lookahead
-        // because it may be the first half of a valid CRLF terminator.
-        let read_limit = u64::try_from(max_message_len.saturating_add(1)).unwrap_or(u64::MAX);
         let reader_task = tokio::spawn(async move {
             let mut reader = BufReader::new(reader);
-            let mut line = String::new();
             loop {
-                line.clear();
-                let read_result = (&mut reader).take(read_limit).read_line(&mut line).await;
+                let read_result =
+                    read_bounded_utf8_payload_line_async(&mut reader, max_message_len).await;
                 match read_result {
-                    Ok(0) => {
+                    Ok(None) => {
                         send_disconnected(
                             &incoming_tx_for_reader,
                             &disconnected_tx_for_reader,
@@ -326,32 +321,8 @@ impl JsonRpcConnection {
                         .await;
                         break;
                     }
-                    Ok(_) => {
-                        if line.ends_with('\n') {
-                            line.pop();
-                            if line.ends_with('\r') {
-                                line.pop();
-                            }
-                        } else if line.len() > max_message_len && line.ends_with('\r') {
-                            match reader.read_u8().await {
-                                Ok(b'\n') => {
-                                    line.pop();
-                                }
-                                Ok(_) => {}
-                                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {}
-                                Err(err) => {
-                                    send_disconnected(
-                                        &incoming_tx_for_reader,
-                                        &disconnected_tx_for_reader,
-                                        Some(format!(
-                                            "failed to read JSON-RPC message from {reader_label}: {err}"
-                                        )),
-                                    )
-                                    .await;
-                                    break;
-                                }
-                            }
-                        }
+                    Ok(Some(frame)) => {
+                        let line = frame.text;
                         if line.len() > max_message_len {
                             send_disconnected(
                                 &incoming_tx_for_reader,
@@ -386,6 +357,17 @@ impl JsonRpcConnection {
                                 .await;
                             }
                         }
+                    }
+                    Err(BoundedLineError::PhysicalFrameTooLong { .. }) => {
+                        send_disconnected(
+                            &incoming_tx_for_reader,
+                            &disconnected_tx_for_reader,
+                            Some(format!(
+                                "JSON-RPC message from {reader_label} exceeds maximum length of {max_message_len} bytes"
+                            )),
+                        )
+                        .await;
+                        break;
                     }
                     Err(err) => {
                         send_disconnected(

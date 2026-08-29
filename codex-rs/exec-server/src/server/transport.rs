@@ -27,6 +27,7 @@ use crate::ExecServerTelemetry;
 use crate::connection::JsonRpcConnection;
 use crate::server::RequestDispatchMode;
 use crate::server::processor::ConnectionProcessor;
+use crate::server::rb_managed::RbManagedServerConfig;
 use crate::telemetry::ConnectionTransport;
 
 pub const DEFAULT_LISTEN_URL: &str = "ws://127.0.0.1:0";
@@ -126,6 +127,35 @@ async fn run_stdio_connection(
         request_dispatch_mode,
     )
     .await
+}
+
+pub(crate) async fn run_rb_managed_stdio(
+    config: RbManagedServerConfig,
+    runtime_paths: ExecServerRuntimePaths,
+    telemetry: ExecServerTelemetry,
+    http_client_factory: HttpClientFactory,
+    request_dispatch_mode: RequestDispatchMode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let processor = ConnectionProcessor::new_rb_managed(
+        config,
+        runtime_paths,
+        telemetry,
+        http_client_factory,
+        request_dispatch_mode,
+    );
+    tracing::info!("rb-managed exec-server listening on stdio");
+    processor
+        .run_connection(
+            JsonRpcConnection::from_stdio(
+                io::stdin(),
+                io::stdout(),
+                "rb-managed exec-server stdio".to_string(),
+            ),
+            ConnectionTransport::Stdio,
+        )
+        .await;
+    processor.shutdown().await;
+    Ok(())
 }
 
 async fn run_stdio_connection_with_io<R, W>(

@@ -297,6 +297,20 @@ where
     pub(crate) fn notification_route(&self, method: &str) -> Option<&NotificationRoute<S>> {
         self.notification_routes.get(method)
     }
+
+    #[cfg(test)]
+    pub(crate) fn request_method_names(&self) -> Vec<&'static str> {
+        let mut methods = self.request_routes.keys().copied().collect::<Vec<_>>();
+        methods.sort_unstable();
+        methods
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notification_method_names(&self) -> Vec<&'static str> {
+        let mut methods = self.notification_routes.keys().copied().collect::<Vec<_>>();
+        methods.sort_unstable();
+        methods
+    }
 }
 
 pub(crate) struct RpcClient {

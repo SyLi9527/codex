@@ -1,0 +1,7 @@
+ResearchBuddy LaunchGuard implementation-validation seam
+
+This crate is part of the Apache-2.0 licensed Codex source tree and reuses
+Codex sandboxing and strict file-descriptor cleanup code through crate APIs.
+
+DeepSeek Harness source code is not copied or linked. Its local failure
+taxonomy informed test-case naming only.

@@ -4,6 +4,7 @@ codex_rust_crate(
     name = "sandboxing",
     compile_data = [
         "src/restricted_read_only_platform_defaults.sbpl",
+        "src/rb_outer_omp.sbpl",
         "src/seatbelt_base_policy.sbpl",
         "src/seatbelt_network_policy.sbpl",
         "src/seatbelt_preferences_policy.sbpl",

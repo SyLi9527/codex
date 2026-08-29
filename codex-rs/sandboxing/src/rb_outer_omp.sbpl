@@ -1,0 +1,68 @@
+(version 1)
+
+; ResearchBuddy's outer OMP profile is intentionally independent of Codex's
+; general process and filesystem-helper profiles. Every omitted operation is
+; denied, including process-fork, network, named Unix sockets, Mach lookup and
+; registration, PTYs, shared memory, and access to shared temporary roots.
+(deny default (with message "RB-LG5-DENY"))
+
+; sandbox-exec must perform the initial exec. The executable is an exact,
+; host-verified path rather than a directory or caller-selected PATH entry.
+(allow process-exec (literal (param "RB_EXECUTABLE")))
+(allow signal (target self))
+(allow process-info* (target self))
+
+; Existing anonymous stdio/capability pipes are the only IPC surface. Seatbelt
+; does not name pipe descriptors as filesystem paths; the launcher closes every
+; non-inventoried descriptor before exec. No named Unix-socket or network grant
+; is present below.
+
+; Minimal character-device access for inherited stdio and runtime entropy.
+(allow file-read-data file-write-data
+  (require-all
+    (literal "/dev/null")
+    (vnode-type CHARACTER-DEVICE)))
+(allow file-read-data
+  (require-all
+    (literal "/dev/urandom")
+    (vnode-type CHARACTER-DEVICE)))
+(allow file-read-metadata
+  (literal "/dev")
+  (literal "/dev/null")
+  (literal "/dev/urandom"))
+
+; This pinned Bun build uses the dyld shared cache. Framework,
+; PrivateFramework, /usr/lib, Homebrew, and local-library subtrees are absent.
+
+; Runtime/allocator feature detection needed before OMP user code runs.
+(allow sysctl-read
+  (sysctl-name "hw.pagesize_compat")
+  (sysctl-name "kern.bootargs")
+  (sysctl-name "kern.iossupportversion")
+  (sysctl-name "kern.osvariant_status")
+  (sysctl-name "security.mac.lockdown_mode_state")
+  (sysctl-name "hw.ephemeral_storage"))
+
+; Exact OS-build-pinned bootstrap envelope. /private is a literal vnode read,
+; not a subtree grant. Preferences, Keychain, /var/db, and shared temp remain
+; inaccessible.
+(allow file-read* file-test-existence (literal "/"))
+(allow file-read* file-test-existence
+  (literal "/System/Library/CoreServices/SystemVersion.plist")
+  (literal "/System/Volumes/Preboot/Cryptexes/OS")
+  (literal "/private")
+  (literal "/usr/share/icu/icudt78l.dat"))
+(allow file-read* file-test-existence file-map-executable
+  (subpath "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld"))
+(allow file-read-metadata file-test-existence
+  (literal "/System/Cryptexes")
+  (literal "/System/Cryptexes/OS")
+  (literal "/System/Cryptexes/App")
+  (literal "/System/Volumes/Data")
+  (literal "/private")
+  (literal "/private/tmp"))
+
+; The exact executable is readable/mappable even when it is a leaf file in a
+; signed runtime root.
+(allow file-read* file-test-existence file-map-executable
+  (literal (param "RB_EXECUTABLE")))

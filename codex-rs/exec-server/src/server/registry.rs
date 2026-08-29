@@ -47,8 +47,9 @@ use crate::protocol::TerminateParams;
 use crate::protocol::WriteParams;
 use crate::rpc::RpcRouter;
 use crate::server::ExecServerHandler;
+use crate::server::rb_managed::ServerProtocol;
 
-pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
+pub(crate) fn build_router(protocol: &ServerProtocol) -> RpcRouter<ExecServerHandler> {
     let mut router = RpcRouter::new();
     router.notification(
         INITIALIZED_METHOD,
@@ -62,6 +63,15 @@ pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
             handler.initialize(params).await
         },
     );
+    if protocol.rb_managed_config().is_some() {
+        router.request(
+            ENVIRONMENT_STATUS_METHOD,
+            |handler: Arc<ExecServerHandler>, _params: ()| async move {
+                handler.environment_status()
+            },
+        );
+        return router;
+    }
     router.request_with_id(
         HTTP_REQUEST_METHOD,
         |handler: Arc<ExecServerHandler>, request_id, params: HttpRequestParams| async move {
@@ -190,3 +200,7 @@ pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
     );
     router
 }
+
+#[cfg(test)]
+#[path = "registry_tests.rs"]
+mod tests;

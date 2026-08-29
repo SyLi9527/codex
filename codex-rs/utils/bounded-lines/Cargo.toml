@@ -1,0 +1,17 @@
+[package]
+name = "codex-utils-bounded-lines"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt"] }
+
+[lib]
+doctest = false

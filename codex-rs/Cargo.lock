@@ -3036,6 +3036,7 @@ dependencies = [
  "codex-shell-command",
  "codex-test-binary-support",
  "codex-utils-absolute-path",
+ "codex-utils-bounded-lines",
  "codex-utils-home-dir",
  "codex-utils-path-uri",
  "codex-utils-pty",
@@ -4023,6 +4024,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-rb-launch-guard"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "codex-sandboxing",
+ "codex-utils-absolute-path",
+ "codex-utils-bounded-lines",
+ "codex-utils-pty",
+ "core-foundation 0.9.4",
+ "ed25519-dalek",
+ "libc",
+ "libsqlite3-sys",
+ "pretty_assertions",
+ "rustix 1.1.4",
+ "security-framework 3.5.1",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "time",
+]
+
+[[package]]
 name = "codex-response-debug-context"
 version = "0.0.0"
 dependencies = [
@@ -4155,7 +4179,9 @@ dependencies = [
  "libc",
  "pretty_assertions",
  "regex-lite",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tracing",
@@ -4557,6 +4583,13 @@ dependencies = [
  "symphonia",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "codex-utils-bounded-lines"
+version = "0.0.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

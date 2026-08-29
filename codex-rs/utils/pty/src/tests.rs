@@ -1604,3 +1604,74 @@ async fn pipe_spawn_no_stdin_can_preserve_inherited_fds() -> anyhow::Result<()> 
 
     Ok(())
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_fd_sweep_closes_sparse_high_descriptors_after_inventory_saturation() -> anyhow::Result<()>
+{
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+
+    if std::env::var("CODEX_SPARSE_FD_SWEEP_CHILD").as_deref() == Ok("1") {
+        let mut limit = libc::rlimit {
+            rlim_cur: 10_000,
+            rlim_max: 10_000,
+        };
+        let current_limit = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) };
+        if current_limit != 0 {
+            unsafe { libc::_exit(80) };
+        }
+        limit.rlim_cur = limit.rlim_cur.min(10_000);
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+            unsafe { libc::_exit(81) };
+        }
+
+        let mut saturation_fds = Vec::with_capacity(4_200);
+        for _ in 0..4_200 {
+            let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+            if fd < 0 {
+                unsafe { libc::_exit(82) };
+            }
+            saturation_fds.push(unsafe { std::fs::File::from_raw_fd(fd) });
+        }
+        let sparse_fd = unsafe { libc::fcntl(saturation_fds[0].as_raw_fd(), libc::F_DUPFD, 9_000) };
+        let preserved_fd =
+            unsafe { libc::fcntl(saturation_fds[1].as_raw_fd(), libc::F_DUPFD, 9_001) };
+        if sparse_fd < 0 || preserved_fd < 0 {
+            unsafe { libc::_exit(83) };
+        }
+
+        if crate::pty::close_inherited_fds_except_strict(&[preserved_fd]).is_err() {
+            unsafe { libc::_exit(85) };
+        }
+        let sparse_result = unsafe { libc::fcntl(sparse_fd, libc::F_GETFD) };
+        let sparse_error = std::io::Error::last_os_error().raw_os_error();
+        let preserved_result = unsafe { libc::fcntl(preserved_fd, libc::F_GETFD) };
+        unsafe {
+            libc::_exit(
+                if sparse_result == -1 && sparse_error == Some(libc::EBADF) && preserved_result >= 0
+                {
+                    0
+                } else {
+                    84
+                },
+            )
+        };
+    }
+
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "tests::macos_fd_sweep_closes_sparse_high_descriptors_after_inventory_saturation",
+            "--nocapture",
+        ])
+        .env("CODEX_SPARSE_FD_SWEEP_CHILD", "1")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "sparse descriptor sweep child failed: status={:?}, stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}

@@ -463,20 +463,6 @@ fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
 // macOS needs a fork-safe sweep because recvmsg cannot set close-on-exec.
 #[cfg(target_os = "macos")]
 pub fn close_inherited_fds_except(preserved_fds: &[RawFd]) {
-    let mut descriptors = [libc::proc_fdinfo {
-        proc_fd: 0,
-        proc_fdtype: 0,
-    }; 1024];
-    // SAFETY: proc_pidinfo writes descriptor records into the stack buffer.
-    let bytes = unsafe {
-        libc::proc_pidinfo(
-            libc::getpid(),
-            libc::PROC_PIDLISTFDS,
-            /*arg*/ 0,
-            descriptors.as_mut_ptr().cast(),
-            std::mem::size_of_val(&descriptors) as libc::c_int,
-        )
-    };
     let close_inheritable = |fd| {
         if fd <= libc::STDERR_FILENO || preserved_fds.contains(&fd) {
             return;
@@ -490,7 +476,25 @@ pub fn close_inherited_fds_except(preserved_fds: &[RawFd]) {
             }
         }
     };
-    if bytes > 0 && (bytes as usize) < std::mem::size_of_val(&descriptors) {
+
+    let mut descriptors = [libc::proc_fdinfo {
+        proc_fd: 0,
+        proc_fdtype: 0,
+    }; 4096];
+    let buffer_bytes = std::mem::size_of_val(&descriptors);
+    // SAFETY: proc_pidinfo writes descriptor records into the stack buffer.
+    // Avoid heap allocation here because this function runs after fork in a
+    // pre-exec callback.
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDLISTFDS,
+            /*arg*/ 0,
+            descriptors.as_mut_ptr().cast(),
+            buffer_bytes as libc::c_int,
+        )
+    };
+    if bytes > 0 && (bytes as usize) < buffer_bytes {
         let count = bytes as usize / std::mem::size_of::<libc::proc_fdinfo>();
         for descriptor in descriptors.iter().take(count) {
             close_inheritable(descriptor.proc_fd);
@@ -498,25 +502,9 @@ pub fn close_inherited_fds_except(preserved_fds: &[RawFd]) {
         return;
     }
 
-    // SAFETY: proc_pidinfo accepts a null buffer when its size is zero.
-    let descriptor_table_bytes = unsafe {
-        libc::proc_pidinfo(
-            libc::getpid(),
-            libc::PROC_PIDLISTFDS,
-            /*arg*/ 0,
-            std::ptr::null_mut(),
-            /*buffersize*/ 0,
-        )
-    };
-    if descriptor_table_bytes > 0 {
-        let upper_bound =
-            descriptor_table_bytes as usize / std::mem::size_of::<libc::proc_fdinfo>();
-        for fd in libc::STDERR_FILENO + 1..upper_bound as RawFd {
-            close_inheritable(fd);
-        }
-        return;
-    }
-
+    // Enumeration failed or exceeded the bounded allocation. Fall back to a
+    // complete descriptor-number scan; never mistake a descriptor count for a
+    // maximum descriptor number because sparse high descriptors would leak.
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -529,6 +517,206 @@ pub fn close_inherited_fds_except(preserved_fds: &[RawFd]) {
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+const STRICT_FD_INVENTORY_CAPACITY: usize = 4096;
+#[cfg(target_os = "macos")]
+const STRICT_FD_SCAN_LIMIT: libc::rlim_t = 1_048_576;
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StrictFdInventory {
+    Complete(usize),
+    Saturated,
+}
+
+#[cfg(target_os = "macos")]
+trait StrictFdSweepSyscalls {
+    fn enumerate(
+        &mut self,
+        descriptors: &mut [libc::proc_fdinfo],
+    ) -> std::io::Result<StrictFdInventory>;
+    fn fd_flags(&mut self, fd: RawFd) -> std::io::Result<Option<libc::c_int>>;
+    fn close_fd(&mut self, fd: RawFd) -> std::io::Result<()>;
+    fn nofile_limit(&mut self) -> std::io::Result<RawFd>;
+}
+
+#[cfg(target_os = "macos")]
+struct LibcStrictFdSweepSyscalls;
+
+#[cfg(target_os = "macos")]
+impl StrictFdSweepSyscalls for LibcStrictFdSweepSyscalls {
+    fn enumerate(
+        &mut self,
+        descriptors: &mut [libc::proc_fdinfo],
+    ) -> std::io::Result<StrictFdInventory> {
+        let buffer_bytes = std::mem::size_of_val(descriptors);
+        // SAFETY: proc_pidinfo writes descriptor records into the caller-owned
+        // stack buffer. A zero/invalid byte count is an execution-stopping
+        // error for the managed launcher, never permission to continue.
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDLISTFDS,
+                /*arg*/ 0,
+                descriptors.as_mut_ptr().cast(),
+                buffer_bytes as libc::c_int,
+            )
+        };
+        if bytes <= 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let bytes = bytes as usize;
+        let record_size = std::mem::size_of::<libc::proc_fdinfo>();
+        if bytes > buffer_bytes || !bytes.is_multiple_of(record_size) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "proc_pidinfo returned an invalid descriptor inventory",
+            ));
+        }
+        if bytes == buffer_bytes {
+            Ok(StrictFdInventory::Saturated)
+        } else {
+            Ok(StrictFdInventory::Complete(bytes / record_size))
+        }
+    }
+
+    fn fd_flags(&mut self, fd: RawFd) -> std::io::Result<Option<libc::c_int>> {
+        // SAFETY: fcntl only queries the descriptor table inherited by this
+        // post-fork child.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags >= 0 {
+            return Ok(Some(flags));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EBADF) {
+            Ok(None)
+        } else {
+            Err(error)
+        }
+    }
+
+    fn close_fd(&mut self, fd: RawFd) -> std::io::Result<()> {
+        // SAFETY: the strict sweep closes only a descriptor proven open and
+        // outside the exact preserved inventory.
+        if unsafe { libc::close(fd) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    fn nofile_limit(&mut self) -> std::io::Result<RawFd> {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes into the stack-owned structure.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if limit.rlim_cur <= libc::STDERR_FILENO as libc::rlim_t
+            || limit.rlim_cur > STRICT_FD_SCAN_LIMIT
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "RLIMIT_NOFILE is outside the strict launcher scan range",
+            ));
+        }
+        Ok(limit.rlim_cur as RawFd)
+    }
+}
+
+/// Closes every inheritable descriptor outside exact stdio and capability FDs.
+///
+/// This is the fail-closed sweep for a managed launcher. Unlike the general
+/// PTY cleanup above, enumeration, descriptor queries, close operations, and
+/// the saturated-inventory fallback all return an error that must abort exec.
+#[cfg(target_os = "macos")]
+pub fn close_inherited_fds_except_strict(preserved_fds: &[RawFd]) -> std::io::Result<()> {
+    close_inherited_fds_except_strict_with(preserved_fds, &mut LibcStrictFdSweepSyscalls)
+}
+
+#[cfg(target_os = "macos")]
+fn close_inherited_fds_except_strict_with(
+    preserved_fds: &[RawFd],
+    syscalls: &mut impl StrictFdSweepSyscalls,
+) -> std::io::Result<()> {
+    for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
+        let Some(flags) = syscalls.fd_flags(fd)? else {
+            return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+        };
+        if flags & libc::FD_CLOEXEC != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "strict inherited descriptor would be closed by exec",
+            ));
+        }
+    }
+    for (index, &fd) in preserved_fds.iter().enumerate() {
+        if fd <= libc::STDERR_FILENO || preserved_fds[..index].contains(&fd) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid strict inherited descriptor inventory",
+            ));
+        }
+        let Some(flags) = syscalls.fd_flags(fd)? else {
+            return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+        };
+        if flags & libc::FD_CLOEXEC != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "strict inherited descriptor would be closed by exec",
+            ));
+        }
+    }
+
+    let mut descriptors = [libc::proc_fdinfo {
+        proc_fd: 0,
+        proc_fdtype: 0,
+    }; STRICT_FD_INVENTORY_CAPACITY];
+    match syscalls.enumerate(&mut descriptors)? {
+        StrictFdInventory::Complete(count) => {
+            for descriptor in descriptors.iter().take(count) {
+                close_strict_inheritable(descriptor.proc_fd, preserved_fds, syscalls, true)?;
+            }
+        }
+        StrictFdInventory::Saturated => {
+            let upper_bound = syscalls.nofile_limit()?;
+            for fd in libc::STDERR_FILENO + 1..upper_bound {
+                close_strict_inheritable(fd, preserved_fds, syscalls, false)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn close_strict_inheritable(
+    fd: RawFd,
+    preserved_fds: &[RawFd],
+    syscalls: &mut impl StrictFdSweepSyscalls,
+    must_exist: bool,
+) -> std::io::Result<()> {
+    if fd <= libc::STDERR_FILENO || preserved_fds.contains(&fd) {
+        return Ok(());
+    }
+    let Some(flags) = syscalls.fd_flags(fd)? else {
+        return if must_exist {
+            Err(std::io::Error::from_raw_os_error(libc::EBADF))
+        } else {
+            Ok(())
+        };
+    };
+    if flags & libc::FD_CLOEXEC == 0 {
+        syscalls.close_fd(fd)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "fd_sweep_tests.rs"]
+mod fd_sweep_tests;
 
 // Other Unix platforms keep their existing fd cleanup.
 #[cfg(all(unix, not(target_os = "macos")))]

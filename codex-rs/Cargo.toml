@@ -91,6 +91,7 @@ members = [
     "rmcp-client",
     "responses-api-proxy",
     "response-debug-context",
+    "rb-launch-guard",
     "sandboxing",
     "stdio-to-uds",
     "otel",
@@ -102,6 +103,7 @@ members = [
     "workload-identity",
     "utils/absolute-path",
     "utils/audio",
+    "utils/bounded-lines",
     "utils/path-uri",
     "utils/cargo-bin",
     "git-utils",
@@ -262,6 +264,7 @@ codex-utils-audio = { path = "utils/audio" }
 codex-utils-cache = { path = "utils/cache" }
 codex-utils-cargo-bin = { path = "utils/cargo-bin" }
 codex-utils-cli = { path = "utils/cli" }
+codex-utils-bounded-lines = { path = "utils/bounded-lines" }
 codex-utils-elapsed = { path = "utils/elapsed" }
 codex-utils-fuzzy-match = { path = "utils/fuzzy-match" }
 codex-utils-home-dir = { path = "utils/home-dir" }

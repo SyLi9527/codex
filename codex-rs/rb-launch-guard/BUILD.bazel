@@ -1,0 +1,10 @@
+load("//:defs.bzl", "codex_rust_crate")
+
+codex_rust_crate(
+    # The Cargo package also ships a binary named `rb-launch-guard`; keep the
+    # Bazel library label distinct from that generated binary target.
+    name = "rb-launch-guard-lib",
+    crate_features = ["rb-managed-sandbox-feasibility"],
+    crate_name = "codex_rb_launch_guard",
+    test_tags = ["no-sandbox"],
+)
