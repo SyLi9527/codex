@@ -107,10 +107,6 @@ pub use process_events::MacProcessEvent;
 ))]
 pub use process_events::MacProcessEventWatcher;
 
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;
-
 /// Test-only cross-domain exclusion: serializes lock-lifecycle tests
 /// (root store open/drop/reopen) against spawn-heavy tests. A fork or
 /// posix_spawn window transiently duplicates every flocked descriptor into
@@ -160,3 +156,7 @@ use rendezvous::OneShotRendezvous;
     any(test, feature = "rb-managed-sandbox-feasibility")
 ))]
 use rendezvous::reject_buffered_pre_identity_bytes;
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

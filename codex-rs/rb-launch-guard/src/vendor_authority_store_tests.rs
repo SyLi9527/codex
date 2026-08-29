@@ -7,7 +7,9 @@ use super::root_protocol::AuthenticatedActorSnapshotV1;
 use super::root_protocol::AuthorizedVerifiedVendorOfferV1;
 use super::root_protocol::admit_root_command;
 use super::root_sqlite::RootSqlite;
+use super::root_sqlite::SqlValue;
 use super::root_sqlite::mutate_store_for_test;
+use super::vendor_authority_store::ActivationExpectationV1;
 use super::vendor_authority_store::GENESIS_LEASE_EPOCH;
 use super::vendor_authority_store::StageFaultPoint;
 use super::vendor_authority_store::VendorAuthorityRootStore;
@@ -17,6 +19,7 @@ use super::vendor_release::PinnedVendorAnchorV1;
 use super::vendor_release::VendorActorRoleV1;
 use super::vendor_release::admit_vendor_offer_bundle;
 use super::vendor_release::verify_vendor_genesis;
+use super::vendor_release::verify_vendor_offer;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::Digest;
@@ -642,6 +645,454 @@ fn snapshot_data(store: &VendorAuthorityRootStore) -> SnapshotData {
         updater_tuple_digest: *snapshot.updater_tuple_digest(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// S2 activation coverage
+// ---------------------------------------------------------------------------
+
+fn updater_actor(
+    tuple_digest: &[u8; 32],
+    release_sequence: u64,
+    lease_epoch: u64,
+) -> AuthenticatedActorSnapshotV1 {
+    AuthenticatedActorSnapshotV1::new_for_test(
+        ActorRoleV1::Updater,
+        hex_bytes(tuple_digest),
+        release_sequence,
+        lease_epoch,
+        "updater-instance-1".to_string(),
+        b"activation-command-bytes",
+    )
+}
+
+fn role_str(role: VendorActorRoleV1) -> &'static str {
+    match role {
+        VendorActorRoleV1::Gateway => "gateway",
+        VendorActorRoleV1::Main => "main",
+        VendorActorRoleV1::Renderer => "renderer",
+        VendorActorRoleV1::ModelBroker => "model-broker",
+        VendorActorRoleV1::NetworkBroker => "network-broker",
+        VendorActorRoleV1::CurrentStateBroker => "current-state-broker",
+        VendorActorRoleV1::Updater => "updater",
+    }
+}
+
+fn blob32(bytes: Vec<u8>) -> [u8; 32] {
+    bytes.try_into().unwrap()
+}
+
+fn actor_row(store: &VendorAuthorityRootStore, role: VendorActorRoleV1) -> ([u8; 32], u64, u64) {
+    let db = RootSqlite::open(store.path(), false).unwrap();
+    let mut statement = db
+        .prepare("SELECT tuple_digest,release_sequence,lease_epoch FROM vendor_actor_authorities WHERE role=?")
+        .unwrap();
+    statement.bind(&[SqlValue::Text(role_str(role))]).unwrap();
+    statement.step().unwrap();
+    (
+        blob32(statement.column_blob(0).unwrap()),
+        u64::try_from(statement.column_i64(1)).unwrap(),
+        u64::try_from(statement.column_i64(2)).unwrap(),
+    )
+}
+
+fn query_blob(store: &VendorAuthorityRootStore, sql: &str) -> Vec<u8> {
+    let db = RootSqlite::open(store.path(), false).unwrap();
+    let mut statement = db.prepare(sql).unwrap();
+    statement.step().unwrap();
+    statement.column_blob(0).unwrap()
+}
+
+/// Builds a direct-SQL attempt at the activation form of the vendor_current
+/// transition, with the epoch delta, revision delta, and the staged
+/// current_bundle binding individually selectable so tests can omit exactly
+/// one hard-gate element.
+fn activation_form_sql(epoch_delta: &str, revision_delta: &str, with_bundle: bool) -> String {
+    let bundle = if with_bundle {
+        ", current_bundle=(SELECT raw_bundle FROM vendor_staged_release WHERE singleton=1)"
+    } else {
+        ""
+    };
+    format!(
+        "UPDATE vendor_current SET store_revision=store_revision{revision_delta}, release_sequence=release_sequence+1, lease_epoch=lease_epoch{epoch_delta}, trust_sequence=(SELECT trust_sequence FROM vendor_staged_release WHERE singleton=1), manifest_digest=(SELECT manifest_digest FROM vendor_staged_release WHERE singleton=1), release_digest=(SELECT release_digest FROM vendor_staged_release WHERE singleton=1), actor_set_digest=(SELECT actor_set_digest FROM vendor_staged_release WHERE singleton=1){bundle} WHERE singleton=1"
+    )
+}
+
+fn assert_transition_abort(store: &VendorAuthorityRootStore, sql: &str) {
+    let error = store
+        .exec_raw_for_test(sql)
+        .expect_err("current transition must abort");
+    assert!(
+        format!("{error:?}").contains("invalid vendor current transition"),
+        "expected the transition trigger to abort, got: {error:?}"
+    );
+}
+
+#[test]
+fn activation_installs_staged_release_with_epoch_and_authority_handover() {
+    let root = private_tempdir();
+    let (mut store, data) = store_and_snapshot(&root);
+    let staged_carrier = super::vendor_release_tests::next_carrier_fixture(data.release_digest);
+    store
+        .stage(verified_offer(data, data.updater_tuple_digest, 1, 1, 1))
+        .unwrap();
+    let after_stage = snapshot_data(&store);
+    assert_eq!(after_stage, data.with_revision(2));
+
+    // 独立推导重验产物：激活写入的 release/actor 字段必须与新鲜 verify 的
+    // 产物逐一相等，而不是与 staged 元数据或本测试的想象相等。
+    let verified_next = verify_vendor_offer(
+        admit_vendor_offer_bundle(&staged_carrier).unwrap(),
+        &PinnedVendorAnchorV1::for_test_fixture(),
+        &after_stage.snapshot(),
+        NOW,
+    )
+    .unwrap();
+    let expected_release_digest = *verified_next.release_object_digest();
+    let expected_actor_set = *verified_next.actor_authorities().digest();
+    let staged_raw = URL_SAFE_NO_PAD.decode(&staged_carrier).unwrap();
+
+    let expectation = ActivationExpectationV1::new(
+        store.snapshot().unwrap(),
+        updater_actor(&data.updater_tuple_digest, 1, 1),
+    );
+    let result = store
+        .activate(&expectation, &PinnedVendorAnchorV1::for_test_fixture(), NOW)
+        .unwrap();
+    assert_eq!(result.revision(), 3);
+    assert_eq!(result.release_sequence(), 2);
+    assert_eq!(result.lease_epoch(), 2);
+
+    // current 八字段逐一：revision+1、trust/manifest 冻结、release 换代、
+    // epoch+1、actor_set/updater_tuple 换代。
+    let activated = snapshot_data(&store);
+    assert_eq!(activated.store_revision, 3);
+    assert_eq!(activated.trust_sequence, data.trust_sequence);
+    assert_eq!(activated.manifest_digest, data.manifest_digest);
+    assert_eq!(activated.release_sequence, 2);
+    assert_eq!(activated.release_digest, expected_release_digest);
+    assert_eq!(activated.lease_epoch, 2);
+    assert_eq!(activated.actor_set_digest, expected_actor_set);
+    assert_eq!(activated.updater_tuple_digest, [18; 32]);
+    // current_bundle 必须是 staged raw 字节本身。
+    assert_eq!(
+        query_blob(&store, "SELECT current_bundle FROM vendor_current WHERE singleton=1"),
+        staged_raw
+    );
+    // staged 槽被消费。
+    assert_eq!(store.staged_count().unwrap(), 0);
+    // 权威换代：7 个 role 行刷新为新 release tuple + 新一代 (rs, ep)。
+    for (index, role) in VendorActorRoleV1::ALL.into_iter().enumerate() {
+        assert_eq!(actor_row(&store, role), ([12 + index as u8; 32], 2, 2));
+    }
+}
+
+#[test]
+fn expired_activation_is_rejected_with_zero_state_change() {
+    let root = private_tempdir();
+    let (mut store, data) = store_and_snapshot(&root);
+    store
+        .stage(verified_offer(data, data.updater_tuple_digest, 1, 1, 1))
+        .unwrap();
+    let before = snapshot_data(&store);
+    let actors_before = VendorActorRoleV1::ALL.map(|role| store.actor_tuple(role).unwrap());
+
+    let expectation = ActivationExpectationV1::new(
+        store.snapshot().unwrap(),
+        updater_actor(&data.updater_tuple_digest, 1, 1),
+    );
+    // fixture 的证书与 release 窗口止于 2026-08-29T00:00:00Z。
+    let error = store
+        .activate(&expectation, &PinnedVendorAnchorV1::for_test_fixture(), "2026-08-29T12:00:00Z")
+        .err();
+    assert!(
+        matches!(error, Some(VendorStoreError::StagedOfferRejected(_))),
+        "expired offer must be refused through StagedOfferRejected: {error:?}"
+    );
+    assert_eq!(snapshot_data(&store), before);
+    assert_eq!(store.staged_count().unwrap(), 1, "the audit row stays");
+    for (index, role) in VendorActorRoleV1::ALL.into_iter().enumerate() {
+        assert_eq!(store.actor_tuple(role).unwrap(), actors_before[index]);
+    }
+
+    // 拒绝后 store 照常可用：同一槽位、新鲜墙钟重试完整成功。
+    let result = store
+        .activate(&expectation, &PinnedVendorAnchorV1::for_test_fixture(), NOW)
+        .unwrap();
+    assert_eq!(result.revision(), 3);
+    assert_eq!(result.lease_epoch(), 2);
+    assert_eq!(store.staged_count().unwrap(), 0);
+}
+
+#[test]
+fn tampered_raw_bundle_is_refused_by_full_reverification() {
+    let root = private_tempdir();
+    let path = root.path().join("vendor-authority.db");
+    let (mut store, data) = store_and_snapshot(&root);
+    store
+        .stage(verified_offer(data, data.updater_tuple_digest, 1, 1, 1))
+        .unwrap();
+    let before = snapshot_data(&store);
+    let actors_before = VendorActorRoleV1::ALL.map(|role| store.actor_tuple(role).unwrap());
+
+    // 经测试通道外部篡改 staged raw 字节（先放行 staged UPDATE 触发器）。
+    mutate_store_for_test(&path, "DROP TRIGGER vendor_staged_no_update").unwrap();
+    mutate_store_for_test(
+        &path,
+        "UPDATE vendor_staged_release SET raw_bundle=x'00' WHERE singleton=1",
+    )
+    .unwrap();
+
+    let expectation = ActivationExpectationV1::new(
+        store.snapshot().unwrap(),
+        updater_actor(&data.updater_tuple_digest, 1, 1),
+    );
+    let error = store
+        .activate(&expectation, &PinnedVendorAnchorV1::for_test_fixture(), NOW)
+        .err();
+    assert!(
+        matches!(error, Some(VendorStoreError::StagedOfferRejected(_))),
+        "tampered bytes must fail admission before any write: {error:?}"
+    );
+    assert_eq!(snapshot_data(&store), before);
+    assert_eq!(store.staged_count().unwrap(), 1);
+    for (index, role) in VendorActorRoleV1::ALL.into_iter().enumerate() {
+        assert_eq!(store.actor_tuple(role).unwrap(), actors_before[index]);
+    }
+}
+
+#[test]
+fn illegal_current_transitions_stay_blocked_in_the_activation_schema() {
+    let root = private_tempdir();
+    let (mut store, data) = store_and_snapshot(&root);
+
+    // 空 staged 槽：完整激活形态也必须被 EXISTS 守卫拒绝（NULL 子查询永远
+    // 不能把表单放松成"无条件放行"）。
+    assert_transition_abort(&store, &activation_form_sql("+1", "+1", true));
+    assert_transition_abort(&store, &activation_form_sql("+2", "+1", true));
+    assert_eq!(snapshot_data(&store), data);
+
+    store
+        .stage(verified_offer(data, data.updater_tuple_digest, 1, 1, 1))
+        .unwrap();
+    let after_stage = snapshot_data(&store);
+
+    // 占槽后：缺 current_bundle 绑定、epoch+2、revision 不动，都缺一个
+    // 硬门要素，必须由 vendor_current_transition 触发器精确拒绝。
+    assert_transition_abort(&store, &activation_form_sql("+1", "+1", false));
+    assert_transition_abort(&store, &activation_form_sql("+2", "+1", true));
+    assert_transition_abort(&store, &activation_form_sql("+1", "", true));
+    assert_eq!(snapshot_data(&store), after_stage);
+    assert_eq!(store.staged_count().unwrap(), 1);
+
+    // 触发器拦截之后 store 未被弄脏：正路激活照常成功。
+    let expectation = ActivationExpectationV1::new(
+        store.snapshot().unwrap(),
+        updater_actor(&data.updater_tuple_digest, 1, 1),
+    );
+    assert_eq!(
+        store
+            .activate(&expectation, &PinnedVendorAnchorV1::for_test_fixture(), NOW)
+            .unwrap()
+            .revision(),
+        3
+    );
+}
+
+#[test]
+fn double_activation_fails_explicitly_with_zero_state_change() {
+    let root = private_tempdir();
+    let (mut store, data) = store_and_snapshot(&root);
+    store
+        .stage(verified_offer(data, data.updater_tuple_digest, 1, 1, 1))
+        .unwrap();
+    let expectation = ActivationExpectationV1::new(
+        store.snapshot().unwrap(),
+        updater_actor(&data.updater_tuple_digest, 1, 1),
+    );
+    store
+        .activate(&expectation, &PinnedVendorAnchorV1::for_test_fixture(), NOW)
+        .unwrap();
+    let activated = snapshot_data(&store);
+    assert_eq!(store.staged_count().unwrap(), 0);
+
+    // 形态一：并发输家持有 stale expectation（上一代 release/epoch）——
+    // actor 四检以 ActorDenied 明确拒绝。
+    assert_eq!(
+        store
+            .activate(&expectation, &PinnedVendorAnchorV1::for_test_fixture(), NOW)
+            .err(),
+        Some(VendorStoreError::ActorDenied)
+    );
+    // 形态二：重读新鲜快照与换代后身份——槽位已空，StagedSlotEmpty。
+    let fresh = ActivationExpectationV1::new(
+        store.snapshot().unwrap(),
+        updater_actor(&[18; 32], activated.release_sequence, activated.lease_epoch),
+    );
+    assert_eq!(
+        store
+            .activate(&fresh, &PinnedVendorAnchorV1::for_test_fixture(), NOW)
+            .err(),
+        Some(VendorStoreError::StagedSlotEmpty)
+    );
+
+    assert_eq!(snapshot_data(&store), activated);
+    assert_eq!(store.staged_count().unwrap(), 0);
+}
+
+#[test]
+fn epoch_advances_only_by_one_per_activation_and_never_without_a_slot() {
+    let root = private_tempdir();
+    let (mut store, data) = store_and_snapshot(&root);
+    store
+        .stage(verified_offer(data, data.updater_tuple_digest, 1, 1, 1))
+        .unwrap();
+    let expectation = ActivationExpectationV1::new(
+        store.snapshot().unwrap(),
+        updater_actor(&data.updater_tuple_digest, 1, 1),
+    );
+    assert_eq!(
+        store
+            .activate(&expectation, &PinnedVendorAnchorV1::for_test_fixture(), NOW)
+            .unwrap()
+            .lease_epoch(),
+        2
+    );
+
+    // 无新 stage 就没有可消费的槽：epoch 不存在任何 +1 旁路。
+    let fresh = ActivationExpectationV1::new(
+        store.snapshot().unwrap(),
+        updater_actor(&[18; 32], 2, 2),
+    );
+    assert_eq!(
+        store
+            .activate(&fresh, &PinnedVendorAnchorV1::for_test_fixture(), NOW)
+            .err(),
+        Some(VendorStoreError::StagedSlotEmpty)
+    );
+    let settled = snapshot_data(&store);
+    assert_eq!(settled.lease_epoch, 2);
+    assert_eq!(settled.store_revision, 3);
+    assert_eq!(settled.release_sequence, 2);
+    assert_eq!(store.staged_count().unwrap(), 0);
+}
+
+#[test]
+fn activation_era_triggers_stay_closed_outside_activation() {
+    let root = private_tempdir();
+    let (mut store, data) = store_and_snapshot(&root);
+    store
+        .stage(verified_offer(data, data.updater_tuple_digest, 1, 1, 1))
+        .unwrap();
+
+    // staged 行：current 未安装该 release，DELETE 仍被钉死。
+    let error = store
+        .exec_raw_for_test("DELETE FROM vendor_staged_release")
+        .expect_err("staged row must stay while current has not installed it");
+    assert!(format!("{error:?}").contains("staged release is immutable"));
+
+    // actors：current 仍在同一代，任何 UPDATE/DELETE 都没有放行条件。
+    let error = store
+        .exec_raw_for_test("UPDATE vendor_actor_authorities SET tuple_digest=x'22' WHERE role='main'")
+        .expect_err("same-generation actor update must abort");
+    assert!(format!("{error:?}").contains("vendor actors are immutable"));
+    let error = store
+        .exec_raw_for_test("UPDATE vendor_actor_authorities SET release_sequence=2, lease_epoch=2 WHERE role='main'")
+        .expect_err("cross-generation actor move must abort while current has not advanced");
+    assert!(format!("{error:?}").contains("vendor actors are immutable"));
+    let error = store
+        .exec_raw_for_test("DELETE FROM vendor_actor_authorities WHERE role='main'")
+        .expect_err("actor delete must abort outside activation");
+    assert!(format!("{error:?}").contains("vendor actors are immutable"));
+
+    // current：单独 epoch+1 不是任何许可形态。
+    assert_transition_abort(
+        &store,
+        "UPDATE vendor_current SET lease_epoch=lease_epoch+1 WHERE singleton=1",
+    );
+    assert_eq!(store.staged_count().unwrap(), 1);
+
+    // 激活后：actor 行已在新一代，current 未再次领先，改/删仍被钉死。
+    let expectation = ActivationExpectationV1::new(
+        store.snapshot().unwrap(),
+        updater_actor(&data.updater_tuple_digest, 1, 1),
+    );
+    store
+        .activate(&expectation, &PinnedVendorAnchorV1::for_test_fixture(), NOW)
+        .unwrap();
+    let error = store
+        .exec_raw_for_test("UPDATE vendor_actor_authorities SET tuple_digest=x'22' WHERE role='main'")
+        .expect_err("post-activation actor update must abort");
+    assert!(format!("{error:?}").contains("vendor actors are immutable"));
+    let error = store
+        .exec_raw_for_test("DELETE FROM vendor_actor_authorities WHERE role='updater'")
+        .expect_err("post-activation actor delete must abort");
+    assert!(format!("{error:?}").contains("vendor actors are immutable"));
+    assert!(store.exec_raw_for_test("DELETE FROM vendor_current").is_err());
+}
+
+#[test]
+fn legacy_v1_store_migrates_in_place_and_stays_usable() {
+    // 场景一：无 staged 行的 v1 库（stage 期 genesis 库的原貌）。
+    let root = private_tempdir();
+    let path = root.path().join("vendor-authority.db");
+    let (store, data) = store_and_snapshot(&root);
+    let genesis_actors = VendorActorRoleV1::ALL.map(|role| store.actor_tuple(role).unwrap());
+    drop(store);
+    VendorAuthorityRootStore::downgrade_store_to_v1_for_test(&path).unwrap();
+    assert_eq!(
+        VendorAuthorityRootStore::stored_user_version_for_test(&path).unwrap(),
+        1
+    );
+
+    let store = VendorAuthorityRootStore::open_existing(root.path()).unwrap();
+    assert_eq!(
+        VendorAuthorityRootStore::stored_user_version_for_test(&path).unwrap(),
+        2
+    );
+    assert_eq!(snapshot_data(&store), data);
+    assert_eq!(store.staged_count().unwrap(), 0);
+    for (index, role) in VendorActorRoleV1::ALL.into_iter().enumerate() {
+        assert_eq!(store.actor_tuple(role).unwrap(), genesis_actors[index]);
+    }
+    drop(store);
+
+    // 迁移后的 v2 库是完整 store：create_new 拒绝且不删除，reopen 稳定。
+    assert_eq!(
+        VendorAuthorityRootStore::create_new(root.path(), genesis()).err(),
+        Some(VendorStoreError::AlreadyExists)
+    );
+    let store = VendorAuthorityRootStore::open_existing(root.path()).unwrap();
+    assert_eq!(snapshot_data(&store), data);
+    drop(store);
+
+    // 场景二：带 staged 行 + revision 2 的 v1 库迁移后必须可激活。
+    let root = private_tempdir();
+    let path = root.path().join("vendor-authority.db");
+    let (mut store, data) = store_and_snapshot(&root);
+    store
+        .stage(verified_offer(data, data.updater_tuple_digest, 1, 1, 1))
+        .unwrap();
+    drop(store);
+    VendorAuthorityRootStore::downgrade_store_to_v1_for_test(&path).unwrap();
+    let mut store = VendorAuthorityRootStore::open_existing(root.path()).unwrap();
+    assert_eq!(
+        VendorAuthorityRootStore::stored_user_version_for_test(&path).unwrap(),
+        2
+    );
+    assert_eq!(snapshot_data(&store), data.with_revision(2));
+    assert_eq!(store.staged_count().unwrap(), 1);
+    let expectation = ActivationExpectationV1::new(
+        store.snapshot().unwrap(),
+        updater_actor(&data.updater_tuple_digest, 1, 1),
+    );
+    let result = store
+        .activate(&expectation, &PinnedVendorAnchorV1::for_test_fixture(), NOW)
+        .unwrap();
+    assert_eq!(result.revision(), 3);
+    assert_eq!(result.lease_epoch(), 2);
+    assert_eq!(store.staged_count().unwrap(), 0);
+}
+
 
 fn store_and_snapshot(root: &TempDir) -> (VendorAuthorityRootStore, SnapshotData) {
     let store = VendorAuthorityRootStore::create_new(root.path(), genesis()).unwrap();
