@@ -101,6 +101,108 @@ fn write_outside_workspace_is_denied_by_seatbelt() {
 }
 
 #[test]
+fn read_outside_workspace_succeeds() {
+    // Codex-standard workspace-write grants full-disk read, so files outside
+    // the workspace root must be readable.
+    let workspace = temp_workspace().unwrap();
+    let outside = temp_workspace().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "outside-read-ok").unwrap();
+
+    let output = run_runner(&[
+        "--workspace-root",
+        workspace.path().to_str().unwrap(),
+        "--",
+        "/bin/cat",
+        outside.path().join("secret.txt").to_str().unwrap(),
+    ])
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "reading outside the workspace must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "outside-read-ok"
+    );
+}
+
+#[test]
+fn scratch_directory_write_succeeds() {
+    // Codex-standard workspace-write keeps the system scratch directories
+    // writable; the compiled profile covers them via the explicit entries,
+    // not the process platform defaults.
+    let workspace = temp_workspace().unwrap();
+    let target = std::env::temp_dir().join(format!(
+        "rb-sandbox-exec-scratch-write-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&target);
+
+    let output = run_runner(&[
+        "--workspace-root",
+        workspace.path().to_str().unwrap(),
+        "--",
+        "/usr/bin/touch",
+        target.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "writing to the scratch directory must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(target.exists(), "the scratch file must have been created");
+    let _ = std::fs::remove_file(&target);
+}
+
+#[test]
+fn workspace_git_metadata_stays_read_only() {
+    // Codex-standard workspace-write protects top-level `.git` metadata of an
+    // existing repository while ordinary workspace writes keep working.
+    let workspace = temp_workspace().unwrap();
+    std::fs::create_dir(workspace.path().join(".git")).unwrap();
+
+    let denied = run_runner(&[
+        "--workspace-root",
+        workspace.path().to_str().unwrap(),
+        "--",
+        "/usr/bin/touch",
+        workspace
+            .path()
+            .join(".git")
+            .join("touched")
+            .to_str()
+            .unwrap(),
+    ])
+    .unwrap();
+    let exit_code = denied.status.code().expect("exit code must be set");
+    assert_ne!(
+        exit_code, RUNNER_FAILURE_EXIT_CODE,
+        "the runner must not report its own failure for a sandboxed denial"
+    );
+    assert_ne!(exit_code, 0, "the .git write must fail");
+    assert!(
+        !workspace.path().join(".git").join("touched").exists(),
+        "no file may be created inside .git"
+    );
+
+    let allowed = run_runner(&[
+        "--workspace-root",
+        workspace.path().to_str().unwrap(),
+        "--",
+        "/usr/bin/touch",
+        workspace.path().join("inside.txt").to_str().unwrap(),
+    ])
+    .unwrap();
+    assert!(
+        allowed.status.success(),
+        "ordinary workspace writes must keep working; stderr: {}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+}
+
+#[test]
 fn network_access_is_denied() {
     let workspace = temp_workspace().unwrap();
     let output = run_runner(&[
@@ -182,14 +284,13 @@ fn print_profile_shows_compiled_policy_without_executing() {
     assert!(stdout.contains("RB_SANDBOX_EXEC_PROFILE_BEGIN"));
     // Default-deny base policy must be present in the compiled SBPL.
     assert!(stdout.contains("(deny default)"));
-    // The workspace root must be wired in as a writable root parameter.
+    // Codex-standard workspace-write grants full-disk read in the compiled
+    // profile and keeps the workspace root as a writable root parameter.
+    assert!(stdout.contains("(allow file-read*)"));
     assert!(stdout.contains("WRITABLE_ROOT_0"));
-    // The process platform defaults (explicit system scratch writes) must be
-    // retained in the compiled profile.
-    assert!(stdout.contains("(subpath \"/private/tmp\")"));
-    // IP network stays denied. The shared platform defaults intentionally keep
-    // a narrow unix-socket allowance for syslog; no IP-based outbound or any
-    // inbound allowance may appear.
+    // IP network stays denied. The shared defaults intentionally keep a narrow
+    // unix-socket allowance for syslog; no IP-based outbound or any inbound
+    // allowance may appear.
     assert!(!stdout.contains("remote ip"));
     assert!(!stdout.contains("allow network-inbound"));
     assert!(!stdout.contains("(allow network-outbound)\n"));

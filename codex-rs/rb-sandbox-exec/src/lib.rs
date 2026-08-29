@@ -17,11 +17,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-use codex_protocol::permissions::FileSystemAccessMode;
-use codex_protocol::permissions::FileSystemPath;
-use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
-use codex_protocol::permissions::FileSystemSpecialPath;
 
 /// Exit code used exclusively for runner-own failures. A sandboxed command
 /// that fails on its own forwards its real exit code instead.
@@ -45,9 +41,11 @@ const FORBIDDEN_ENV_KEY_PREFIXES: &[&str] = &["DYLD_"];
 /// Runner inputs that do not depend on the command being executed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxExecOptions {
-    /// Writable workspace root. It becomes the only additional writable root
-    /// in the filesystem policy and the working directory of the sandboxed
-    /// command. It is canonicalized before use.
+    /// Writable workspace root. It is canonicalized before use and wired into
+    /// the codex-standard workspace-write filesystem policy: together with the
+    /// standard scratch directories (`/tmp`, `$TMPDIR`) it forms the writable
+    /// set, while top-level `.git`/`.agents` metadata under it stays read-only.
+    /// It is also the working directory of the sandboxed command.
     pub workspace_root: PathBuf,
     /// Optional wall-clock limit after which the runner kills the command's
     /// whole process group and exits with [`TIMEOUT_EXIT_CODE`].
@@ -82,19 +80,16 @@ pub fn canonical_workspace_root(workspace_root: &Path) -> Result<PathBuf, String
     })
 }
 
-/// Builds the restricted filesystem policy for the runner.
+/// Builds the filesystem policy for the runner: the codex-standard
+/// workspace-write profile, constructed by the shared
+/// [`FileSystemSandboxPolicy::workspace_write`] constructor and nothing else.
 ///
-/// Base is a restricted minimal-read policy: the `Minimal` read marker keeps
-/// the shared platform defaults in the compiled profile, which grant standard
-/// system read access (enough to exec `/bin`, `/usr/bin`, ... plus loader
-/// paths) and the explicit system scratch-directory writes
-/// (`/tmp`, `/private/tmp`, `/var/tmp`, `/private/var/tmp`). On top of that:
-/// - a `Write` entry for the canonicalized workspace root, which the shared
-///   Seatbelt compiler turns into the only additional writable root.
-///
-/// This mirrors the exec-server helper pattern
-/// (`add_helper_runtime_permissions`): the marker is only effective while the
-/// policy has no full-disk read grant, so no broad `Root` read entry is added.
+/// That means full-disk read access (`(allow file-read*)` in the compiled
+/// profile); writes limited to the canonicalized workspace root plus the
+/// standard scratch directories (`/tmp`, `$TMPDIR`); top-level `.git`/
+/// `.agents` metadata under the workspace root stays read-only; and no
+/// ResearchBuddy-specific entries are added, so the effective permissions are
+/// identical to a codex `workspace-write` session on the same root.
 pub fn build_file_system_policy(
     canonical_workspace_root: &Path,
 ) -> Result<FileSystemSandboxPolicy, String> {
@@ -106,18 +101,11 @@ pub fn build_file_system_policy(
                     canonical_workspace_root.display()
                 )
             })?;
-    let entries = vec![
-        // Marker entry: keeps the shared platform defaults in the compiled
-        // profile (system reads plus explicit system scratch writes).
-        FileSystemSandboxEntry::new(
-            FileSystemPath::Special {
-                value: FileSystemSpecialPath::Minimal,
-            },
-            FileSystemAccessMode::Read,
-        ),
-        FileSystemSandboxEntry::new(FileSystemPath::from(root), FileSystemAccessMode::Write),
-    ];
-    Ok(FileSystemSandboxPolicy::restricted(entries))
+    Ok(FileSystemSandboxPolicy::workspace_write(
+        std::slice::from_ref(&root),
+        /*exclude_tmpdir_env_var*/ false,
+        /*exclude_slash_tmp*/ false,
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -301,19 +289,24 @@ mod tests {
     }
 
     #[test]
-    fn file_system_policy_grants_workspace_write_and_keeps_platform_defaults() {
+    fn file_system_policy_matches_codex_workspace_write() {
         let workspace = tempfile::tempdir().unwrap();
+        // The metadata protections only materialize for paths that exist, so
+        // create the directory codex would protect in a real repository.
+        std::fs::create_dir(workspace.path().join(".git")).unwrap();
         let canonical_root = canonical_workspace_root(workspace.path()).unwrap();
         let policy = build_file_system_policy(&canonical_root).unwrap();
         assert!(matches!(
             policy.kind,
             codex_protocol::permissions::FileSystemSandboxKind::Restricted
         ));
-        // The minimal-read marker keeps the shared platform defaults (system
-        // reads plus the explicit system scratch-directory writes) enabled.
-        assert!(policy.include_platform_defaults());
-        assert!(!policy.has_full_disk_read_access());
+        // Codex-standard workspace-write: full-disk read, writes stay scoped.
+        assert!(policy.has_full_disk_read_access());
         assert!(!policy.has_full_disk_write_access());
+        // Full-disk read disables the restricted platform-defaults block in
+        // the compiled profile; `/tmp` writes come from the explicit
+        // scratch-directory entries instead.
+        assert!(!policy.include_platform_defaults());
         let writable_roots = policy.get_writable_roots_with_cwd(&canonical_root);
         assert!(
             writable_roots
@@ -326,17 +319,23 @@ mod tests {
             "writes inside the workspace root must be allowed"
         );
         assert!(
-            policy.can_read_path_with_cwd(&canonical_root.join("inside.txt"), &canonical_root),
-            "reads inside the workspace root must be allowed"
+            policy.can_read_path_with_cwd(Path::new("/etc/passwd"), &canonical_root),
+            "full-disk read must cover paths outside the workspace root"
         );
         assert!(
             !policy.can_write_path_with_cwd(Path::new("/etc/passwd"), &canonical_root),
             "writes outside the workspace root must be denied"
         );
+        // Top-level workspace metadata stays read-only but readable, matching
+        // the codex workspace-write defaults.
+        let git_head = canonical_root.join(".git").join("HEAD");
         assert!(
-            !policy.can_read_path_with_cwd(Path::new("/etc/passwd"), &canonical_root),
-            "policy-level reads outside the workspace root must be denied; \
-             system reads come from the compiled platform defaults instead"
+            !policy.can_write_path_with_cwd(&git_head, &canonical_root),
+            ".git under the workspace root must stay read-only"
+        );
+        assert!(
+            policy.can_read_path_with_cwd(&git_head, &canonical_root),
+            ".git must stay readable"
         );
     }
 
