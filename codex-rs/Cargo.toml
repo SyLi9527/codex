@@ -92,6 +92,7 @@ members = [
     "responses-api-proxy",
     "response-debug-context",
     "rb-launch-guard",
+    "rb-sandbox-exec",
     "sandboxing",
     "stdio-to-uds",
     "otel",

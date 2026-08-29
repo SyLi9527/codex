@@ -11725,6 +11725,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-sandbox-exec"
+version = "0.0.0"
+dependencies = [
+ "codex-protocol",
+ "codex-sandboxing",
+ "codex-utils-absolute-path",
+ "libc",
+ "tempfile",
+]
+
+[[package]]
 name = "rcgen"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

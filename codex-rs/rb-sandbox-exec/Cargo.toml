@@ -1,0 +1,26 @@
+[package]
+name = "rb-sandbox-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "rb_sandbox_exec"
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "rb-sandbox-exec"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+codex-protocol = { workspace = true }
+codex-sandboxing = { workspace = true }
+codex-utils-absolute-path = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
