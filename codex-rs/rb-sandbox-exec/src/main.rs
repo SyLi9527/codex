@@ -21,9 +21,10 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use rb_sandbox_exec::NetworkMode;
 use rb_sandbox_exec::RUNNER_FAILURE_EXIT_CODE;
 use rb_sandbox_exec::RUNNER_FAILURE_MARKER;
-use rb_sandbox_exec::SUPPORTED_NETWORK_MODE;
+use rb_sandbox_exec::SUPPORTED_NETWORK_MODES;
 use rb_sandbox_exec::SandboxExecOptions;
 use rb_sandbox_exec::TIMEOUT_EXIT_CODE;
 
@@ -75,6 +76,7 @@ struct Cli {
     timeout_ms: Option<u64>,
     print_profile: bool,
     sets: Vec<(String, String)>,
+    network: NetworkMode,
     command: Vec<String>,
 }
 
@@ -90,12 +92,14 @@ fn main() {
         timeout_ms,
         print_profile,
         sets,
+        network,
         command,
     } = cli;
     let options = SandboxExecOptions {
         workspace_root: PathBuf::from(workspace_root),
         timeout_ms,
         extra_env: sets,
+        network_mode: network,
     };
     let plan = match rb_sandbox_exec::build_sandbox_exec_plan(&options, &command) {
         Ok(plan) => plan,
@@ -125,7 +129,7 @@ fn parse_cli(raw_args: &[String]) -> Result<Cli, String> {
     }
 
     let mut workspace_root: Option<String> = None;
-    let mut network: Option<String> = None;
+    let mut network: Option<NetworkMode> = None;
     let mut timeout_ms: Option<u64> = None;
     let mut print_profile = false;
     let mut sets: Vec<(String, String)> = Vec::new();
@@ -140,7 +144,10 @@ fn parse_cli(raw_args: &[String]) -> Result<Cli, String> {
             }
             "--network" => {
                 let value = next_flag_value(flags, &mut index, flag)?.to_string();
-                replace_once(&mut network, value, flag)?;
+                let mode = NetworkMode::parse(&value).ok_or_else(|| {
+                    format!("--network only supports {SUPPORTED_NETWORK_MODES:?}, got `{value}`")
+                })?;
+                replace_once(&mut network, mode, flag)?;
             }
             "--timeout-ms" => {
                 let value = next_flag_value(flags, &mut index, flag)?;
@@ -178,18 +185,12 @@ fn parse_cli(raw_args: &[String]) -> Result<Cli, String> {
 
     let workspace_root =
         workspace_root.ok_or_else(|| "missing required flag --workspace-root <dir>".to_string())?;
-    if let Some(mode) = &network
-        && mode != SUPPORTED_NETWORK_MODE
-    {
-        return Err(format!(
-            "--network only supports `{SUPPORTED_NETWORK_MODE}` in this version, got `{mode}`"
-        ));
-    }
     Ok(Cli {
         workspace_root,
         timeout_ms,
         print_profile,
         sets,
+        network: network.unwrap_or(NetworkMode::Deny),
         command,
     })
 }

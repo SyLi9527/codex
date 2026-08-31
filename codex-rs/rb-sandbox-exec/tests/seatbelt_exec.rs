@@ -438,7 +438,7 @@ fn unsupported_network_mode_is_rejected() {
         "--workspace-root",
         workspace.path().to_str().unwrap(),
         "--network",
-        "enabled",
+        "proxy",
         "--",
         "/bin/echo",
         "must-not-run",
@@ -450,6 +450,35 @@ fn unsupported_network_mode_is_rejected() {
     assert!(stderr.contains("--network"));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("must-not-run"));
+}
+
+#[test]
+fn network_mode_enabled_allows_outbound() {
+    // codex workspace-write `network_access = true` parity: `--network
+    // enabled` swaps the compiled policy to one that allows outbound traffic.
+    let workspace = temp_workspace().unwrap();
+    let output = run_runner(&[
+        "--workspace-root",
+        workspace.path().to_str().unwrap(),
+        "--network",
+        "enabled",
+        "--timeout-ms",
+        "15000",
+        "--",
+        "/usr/bin/curl",
+        "--max-time",
+        "10",
+        "https://example.com",
+    ])
+    .unwrap();
+    let exit_code = output.status.code().expect("exit code must be set");
+    assert_eq!(
+        exit_code,
+        0,
+        "outbound network must succeed under --network enabled; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("example"));
 }
 
 #[test]

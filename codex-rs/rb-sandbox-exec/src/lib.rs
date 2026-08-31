@@ -18,6 +18,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 
 /// Exit code used exclusively for runner-own failures. A sandboxed command
 /// that fails on its own forwards its real exit code instead.
@@ -27,8 +28,40 @@ pub const RUNNER_FAILURE_EXIT_CODE: i32 = 250;
 pub const TIMEOUT_EXIT_CODE: i32 = 124;
 /// Stderr marker prefix for runner-own failures: `RB_SANDBOX_UNAVAILABLE:<reason>`.
 pub const RUNNER_FAILURE_MARKER: &str = "RB_SANDBOX_UNAVAILABLE";
-/// The only network mode supported in S1.
-pub const SUPPORTED_NETWORK_MODE: &str = "deny";
+/// Network modes accepted by `--network`, mirroring codex workspace-write's
+/// `network_access` toggle: `deny` (default) keeps the restricted network
+/// policy, `enabled` swaps in the shared policy that allows outbound traffic.
+pub const SUPPORTED_NETWORK_MODES: &[&str] = &["deny", "enabled"];
+
+/// Parsed `--network` mode for one execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetworkMode {
+    /// Restricted network policy (the default; no outbound allowances).
+    #[default]
+    Deny,
+    /// Enabled network policy (outbound traffic allowed, codex
+    /// workspace-write `network_access = true` parity).
+    Enabled,
+}
+
+impl NetworkMode {
+    /// Parses a `--network` flag value; `None` when unsupported.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "deny" => Some(Self::Deny),
+            "enabled" => Some(Self::Enabled),
+            _ => None,
+        }
+    }
+
+    /// The shared network sandbox policy this mode compiles to.
+    pub fn network_sandbox_policy(self) -> NetworkSandboxPolicy {
+        match self {
+            Self::Deny => NetworkSandboxPolicy::Restricted,
+            Self::Enabled => NetworkSandboxPolicy::Enabled,
+        }
+    }
+}
 
 /// Environment variables copied from the caller into the sandboxed process.
 const PRESERVED_ENV_KEYS: &[&str] = &["PATH", "HOME", "TMPDIR", "LANG", "SHELL"];
@@ -53,6 +86,8 @@ pub struct SandboxExecOptions {
     /// Explicit `--set KEY=VALUE` overrides applied after the preserved
     /// environment. `DYLD_*` keys are rejected here as well.
     pub extra_env: Vec<(String, String)>,
+    /// Network policy mode for this execution; defaults to [`NetworkMode::Deny`].
+    pub network_mode: NetworkMode,
 }
 
 /// Everything the runner needs to spawn the sandboxed command.
@@ -127,9 +162,7 @@ pub fn build_sandbox_exec_plan(
         codex_sandboxing::seatbelt::CreateSeatbeltCommandArgsParams {
             command: command.to_vec(),
             file_system_sandbox_policy: &file_system_sandbox_policy,
-            // S1 only supports network deny; `Restricted` keeps the compiled
-            // profile without any network allowances.
-            network_sandbox_policy: codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+            network_sandbox_policy: options.network_mode.network_sandbox_policy(),
             sandbox_policy_cwd: cwd.as_path(),
             enforce_managed_network: false,
             managed_network: None,
@@ -347,6 +380,7 @@ mod tests {
             workspace_root: workspace.path().to_path_buf(),
             timeout_ms: None,
             extra_env: vec![("RB_TEST_MARKER".to_string(), "value".to_string())],
+            network_mode: NetworkMode::Deny,
         };
         let plan = build_sandbox_exec_plan(&options, &["/bin/echo".to_string(), "ok".to_string()])
             .unwrap();
@@ -379,6 +413,7 @@ mod tests {
             workspace_root: PathBuf::from("/tmp"),
             timeout_ms: None,
             extra_env: vec![],
+            network_mode: NetworkMode::Deny,
         };
         let error = build_sandbox_exec_plan(&options, &[]).unwrap_err();
         assert!(error.contains("missing command"));
@@ -390,6 +425,7 @@ mod tests {
             workspace_root: PathBuf::from("/nonexistent/rb-sandbox-exec-root"),
             timeout_ms: None,
             extra_env: vec![],
+            network_mode: NetworkMode::Deny,
         };
         let error = build_sandbox_exec_plan(&options, &["/bin/echo".to_string()]).unwrap_err();
         assert!(error.contains("not accessible"));
