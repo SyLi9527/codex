@@ -262,6 +262,56 @@ fn timeout_kills_the_process_group() {
 }
 
 #[test]
+fn fatal_signal_to_the_runner_kills_the_child_group() {
+    // T1 leftover: when the runner itself is terminated (supervisor restart,
+    // Ctrl-C, session teardown), the sandboxed command's whole process group
+    // must be killed instead of outliving the runner as orphans.
+    let workspace = temp_workspace().unwrap();
+    let mut runner = Command::new(runner())
+        .args([
+            "--workspace-root",
+            workspace.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "touch ready && exec /bin/sleep 30",
+        ])
+        .spawn()
+        .expect("runner binary must spawn");
+    // Wait until the runner has installed its handlers and forked the child
+    // (the child signals readiness through a workspace marker) instead of a
+    // fixed sleep: a freshly built binary can take a while to start.
+    let marker = workspace.path().join("ready");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the sandboxed child never signalled readiness"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    unsafe {
+        libc::kill(runner.id() as libc::pid_t, libc::SIGTERM);
+    }
+    let status = runner.wait().unwrap();
+    assert_eq!(
+        status.code(),
+        Some(143),
+        "the runner must exit 128+SIGTERM after forwarding the kill"
+    );
+    // The killed `sleep` must not linger.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !std::process::Command::new("/usr/bin/pgrep")
+            .args(["-f", "sleep 30$"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false),
+        "no orphaned `sleep 30` may survive the runner's own termination"
+    );
+}
+
+#[test]
 fn print_profile_shows_compiled_policy_without_executing() {
     let workspace = temp_workspace().unwrap();
     let output = run_runner(&[

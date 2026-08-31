@@ -10,8 +10,14 @@
 //! compilation errors, a missing `sandbox-exec`, or spawn errors) print a
 //! single `RB_SANDBOX_UNAVAILABLE:<reason>` line to stderr and exit with 250.
 //! The command is never executed without a sandbox.
+//!
+//! If the runner itself receives `SIGINT`/`SIGTERM`/`SIGHUP`, it kills the
+//! sandboxed command's whole process group before exiting `128 + signum`, so
+//! a supervisor teardown never leaves orphaned grandchildren behind.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -24,6 +30,46 @@ use rb_sandbox_exec::TIMEOUT_EXIT_CODE;
 /// Poll interval while waiting for the sandboxed command.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
+/// Process group id of the live sandboxed child (its pid, since it leads its
+/// own group); `0` while no child is running. Written on spawn/reap and read
+/// from the signal handler.
+#[cfg(unix)]
+static SANDBOXED_CHILD_PGID: AtomicI32 = AtomicI32::new(0);
+
+/// Fatal-signal disposition: take the sandboxed child's whole process group
+/// down with us, then exit `128 + signum` like a shell would. Only
+/// async-signal-safe calls (`kill`, `_exit`) happen here.
+#[cfg(unix)]
+extern "C" fn kill_child_group_and_exit(signum: libc::c_int) {
+    let pgid = SANDBOXED_CHILD_PGID.load(Ordering::SeqCst);
+    if pgid > 0 {
+        // A negative pid targets the group; ESRCH (group already gone) is
+        // fine and intentionally ignored.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    unsafe { libc::_exit(128 + signum) };
+}
+
+/// Install the fatal-signal disposition for the signals a supervisor or an
+/// interactive session sends on teardown. Registered before any child exists;
+/// with no live child the handler only records the conventional exit code.
+#[cfg(unix)]
+fn install_fatal_signal_forwarding() {
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = kill_child_group_and_exit as extern "C" fn(libc::c_int) as usize;
+        action.sa_flags = libc::SA_RESTART;
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn install_fatal_signal_forwarding() {}
+
 struct Cli {
     workspace_root: String,
     timeout_ms: Option<u64>,
@@ -33,6 +79,7 @@ struct Cli {
 }
 
 fn main() {
+    install_fatal_signal_forwarding();
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let cli = match parse_cli(&raw_args) {
         Ok(cli) => cli,
@@ -203,11 +250,21 @@ fn run_plan(plan: &rb_sandbox_exec::SandboxExecPlan, timeout: Option<Duration>) 
         Ok(child) => child,
         Err(err) => fail_unavailable(&format!("spawn-failed: {err}")),
     };
+    #[cfg(unix)]
+    {
+        // The child leads its own process group, so its pid is the pgid the
+        // fatal-signal handler uses for the group kill.
+        SANDBOXED_CHILD_PGID.store(child.id() as libc::pid_t, Ordering::SeqCst);
+    }
 
     let started = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return exit_code_for_status(status),
+            Ok(Some(status)) => {
+                #[cfg(unix)]
+                SANDBOXED_CHILD_PGID.store(0, Ordering::SeqCst);
+                return exit_code_for_status(status);
+            }
             Ok(None) => {}
             Err(err) => fail_unavailable(&format!("wait-failed: {err}")),
         }
@@ -218,6 +275,8 @@ fn run_plan(plan: &rb_sandbox_exec::SandboxExecPlan, timeout: Option<Duration>) 
             // Reap the child so no zombie remains; the group kill already
             // decided the outcome.
             let _ = child.wait();
+            #[cfg(unix)]
+            SANDBOXED_CHILD_PGID.store(0, Ordering::SeqCst);
             return TIMEOUT_EXIT_CODE;
         }
         std::thread::sleep(POLL_INTERVAL);
