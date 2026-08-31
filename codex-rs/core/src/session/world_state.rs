@@ -44,9 +44,20 @@ impl Session {
         let model_instructions = turn_context
             .model_info()
             .get_model_instructions(turn_context.personality());
+        let model_instructions = if !turn_context.config.update_plan_enabled
+            && turn_context.config.model_catalog.is_none()
+            && (turn_context.config.base_instructions.is_none()
+                || matches!(
+                    turn_context.config.base_instructions_provenance,
+                    Some(BaseInstructionsProvenance::Model { .. })
+                )) {
+            crate::context::without_update_plan_instructions(&model_instructions)
+        } else {
+            model_instructions
+        };
+        let base_instructions = self.get_prompt_base_instructions().await.text;
         let (previous_model, previous_context, base_instructions) = {
             let state = self.state.lock().await;
-            let base_instructions = state.session_configuration.base_instructions.clone();
             (
                 state
                     .previous_turn_settings()
@@ -105,9 +116,13 @@ impl Session {
                 personality_is_baked,
             ));
         }
-        if turn_context.config.features.enabled(Feature::TokenBudget)
-            && turn_context.model_context_window().is_some()
-        {
+        let token_budget_enabled = turn_context.config.features.enabled(Feature::TokenBudget)
+            && step_context
+                .settings
+                .model_info
+                .resolved_context_window()
+                .is_some();
+        if token_budget_enabled {
             let window_ids = self.state.lock().await.auto_compact_window_ids();
             world_state.add_section(TokenBudgetContext::new(
                 turn_context
@@ -119,16 +134,13 @@ impl Session {
                 window_ids.window_id,
                 /*thread_hint*/ None,
             ));
-            if let Some(guidance) = turn_context
-                .config
-                .token_budget
-                .as_ref()
-                .and_then(|config| config.guidance_message.as_deref())
-                .filter(|message| !message.trim().is_empty())
-            {
-                world_state.add_section(ContextWindowGuidanceState::new(guidance));
-            }
         }
+        let guidance = step_context
+            .token_budget
+            .as_ref()
+            .and_then(|config| config.guidance_message.as_deref())
+            .filter(|_| token_budget_enabled);
+        world_state.add_section(ContextWindowGuidanceState::new(guidance));
         let realtime_mode_instructions = self.conversation.mode_instructions().await;
         world_state.add_section(RealtimeState::new(
             turn_context.realtime_active,
@@ -188,6 +200,8 @@ impl Session {
                     .model_messages
                     .as_ref()
                     .and_then(|messages| messages.collaboration_modes.as_ref()),
+                turn_context.config.update_plan_enabled,
+                turn_context.config.model_catalog.is_some(),
             ));
         }
         if !crate::guardian::is_basic_session_source(&turn_context.session_source) {
@@ -226,6 +240,7 @@ impl Session {
                     &step_context.environments,
                     Some(current_date),
                 )
+                .await
                 .with_subagents(environment_subagents),
             );
         }
