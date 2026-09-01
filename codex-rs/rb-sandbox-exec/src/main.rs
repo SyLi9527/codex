@@ -136,6 +136,7 @@ fn parse_cli(raw_args: &[String]) -> Result<Cli, String> {
     let mut workspace_root: Option<String> = None;
     let mut network: Option<NetworkMode> = None;
     let mut sandbox_policy_json: Option<String> = None;
+    let mut sandbox_policy_file: Option<String> = None;
     let mut timeout_ms: Option<u64> = None;
     let mut print_profile = false;
     let mut sets: Vec<(String, String)> = Vec::new();
@@ -158,6 +159,10 @@ fn parse_cli(raw_args: &[String]) -> Result<Cli, String> {
             "--sandbox-policy" => {
                 let value = next_flag_value(flags, &mut index, flag)?.to_string();
                 replace_once(&mut sandbox_policy_json, value, flag)?;
+            }
+            "--sandbox-policy-file" => {
+                let value = next_flag_value(flags, &mut index, flag)?.to_string();
+                replace_once(&mut sandbox_policy_file, value, flag)?;
             }
             "--timeout-ms" => {
                 let value = next_flag_value(flags, &mut index, flag)?;
@@ -195,11 +200,29 @@ fn parse_cli(raw_args: &[String]) -> Result<Cli, String> {
 
     let workspace_root =
         workspace_root.ok_or_else(|| "missing required flag --workspace-root <dir>".to_string())?;
+    if sandbox_policy_json.is_some() && sandbox_policy_file.is_some() {
+        return Err(
+            "--sandbox-policy and --sandbox-policy-file are mutually exclusive".to_string(),
+        );
+    }
+    let sandbox_policy_json = match (sandbox_policy_json, sandbox_policy_file) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "--sandbox-policy and --sandbox-policy-file are mutually exclusive".to_string(),
+            );
+        }
+        (Some(json), None) => Some(json),
+        (None, Some(path)) => Some(
+            std::fs::read_to_string(&path)
+                .map_err(|err| format!("cannot read --sandbox-policy-file {path}: {err}"))?,
+        ),
+        (None, None) => None,
+    };
     if sandbox_policy_json.is_some() && network.is_some() {
         // The policy fully determines network access; an explicit --network
         // alongside it would be ambiguous.
         return Err(
-            "--sandbox-policy and --network are mutually exclusive; the policy's              `network_access` field determines network access"
+            "--sandbox-policy and --network are mutually exclusive; the policy's `network_access` field determines network access"
                 .to_string(),
         );
     }

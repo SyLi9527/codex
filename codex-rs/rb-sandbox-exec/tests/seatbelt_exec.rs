@@ -511,6 +511,137 @@ fn sandbox_policy_json_read_only_denies_writes() {
 }
 
 #[test]
+fn sandbox_policy_file_path_loads_policy() {
+    // Policies can arrive as files: same JSON, no argv-size ceiling.
+    let workspace = temp_workspace().unwrap();
+    let policy_path = workspace.path().join("policy.json");
+    std::fs::write(
+        &policy_path,
+        r#"{"type":"workspace-write","network_access":true}"#,
+    )
+    .unwrap();
+    let output = run_runner(&[
+        "--workspace-root",
+        workspace.path().to_str().unwrap(),
+        "--sandbox-policy-file",
+        policy_path.to_str().unwrap(),
+        "--timeout-ms",
+        "15000",
+        "--",
+        "/usr/bin/curl",
+        "--max-time",
+        "10",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "https://pypi.org/simple/qrcode/",
+    ])
+    .unwrap();
+    let exit_code = output.status.code().expect("exit code must be set");
+    assert_eq!(
+        exit_code,
+        0,
+        "policy file must load and open the network; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "200");
+}
+
+#[test]
+fn explicit_writable_root_reenables_git_writes() {
+    // The future .git-grant materialization path: an EXPLICIT write rule for
+    // `<root>/.git` suppresses the default read-only carve-out, so the rest
+    // of the workspace boundary stays intact while git metadata becomes
+    // writable inside the sandbox.
+    let workspace = temp_workspace().unwrap();
+    std::fs::create_dir(workspace.path().join(".git")).unwrap();
+    let git_root = workspace.path().join(".git").to_str().unwrap().to_string();
+    let policy = format!(
+        r#"{{"type":"workspace-write","network_access":false,"writable_roots":["{git_root}"]}}"#
+    );
+    let output = run_runner(&[
+        "--workspace-root",
+        workspace.path().to_str().unwrap(),
+        "--sandbox-policy",
+        &policy,
+        "--",
+        "/usr/bin/touch",
+        workspace
+            .path()
+            .join(".git")
+            .join("granted")
+            .to_str()
+            .unwrap(),
+    ])
+    .unwrap();
+    let exit_code = output.status.code().expect("exit code must be set");
+    assert_eq!(
+        exit_code,
+        0,
+        "the explicit .git writable root must open .git writes; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(workspace.path().join(".git").join("granted").exists());
+    // Outside-workspace writes stay denied under the same policy.
+    let home = std::env::var("HOME").expect("HOME must be set");
+    let outside = std::path::Path::new(&home).join("rb-sandbox-git-grant-probe");
+    let _ = std::fs::remove_file(&outside);
+    let denied = run_runner(&[
+        "--workspace-root",
+        workspace.path().to_str().unwrap(),
+        "--sandbox-policy",
+        &policy,
+        "--",
+        "/usr/bin/touch",
+        outside.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert_ne!(
+        denied.status.code(),
+        Some(0),
+        "outside-workspace writes must stay denied"
+    );
+    assert!(!outside.exists());
+}
+
+#[test]
+fn danger_full_access_policy_runs_unrestricted() {
+    // The nine-grid Full-Access lane as a policy: danger-full-access lifts
+    // both file-system and network boundaries inside the sandbox.
+    let workspace = temp_workspace().unwrap();
+    let home = std::env::var("HOME").expect("HOME must be set");
+    let outside = std::path::Path::new(&home).join("rb-sandbox-full-access-probe");
+    let _ = std::fs::remove_file(&outside);
+    let output = run_runner(&[
+        "--workspace-root",
+        workspace.path().to_str().unwrap(),
+        "--sandbox-policy",
+        r#"{"type":"danger-full-access"}"#,
+        "--timeout-ms",
+        "15000",
+        "--",
+        "/bin/sh",
+        "-c",
+        &format!(
+            "touch '{}' && curl -sS --max-time 10 -o /dev/null -w '%{{http_code}}' https://pypi.org/simple/",
+            outside.display()
+        ),
+    ])
+    .unwrap();
+    let exit_code = output.status.code().expect("exit code must be set");
+    assert_eq!(
+        exit_code,
+        0,
+        "danger-full-access must allow outside writes and network; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(outside.exists(), "the outside-workspace write must land");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "200");
+    let _ = std::fs::remove_file(&outside);
+}
+
+#[test]
 fn sandbox_policy_and_network_flag_conflict() {
     let workspace = temp_workspace().unwrap();
     let output = run_runner(&[
