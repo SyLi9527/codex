@@ -21,12 +21,14 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use codex_protocol::protocol::SandboxPolicy;
 use rb_sandbox_exec::NetworkMode;
 use rb_sandbox_exec::RUNNER_FAILURE_EXIT_CODE;
 use rb_sandbox_exec::RUNNER_FAILURE_MARKER;
 use rb_sandbox_exec::SUPPORTED_NETWORK_MODES;
 use rb_sandbox_exec::SandboxExecOptions;
 use rb_sandbox_exec::TIMEOUT_EXIT_CODE;
+use rb_sandbox_exec::parse_sandbox_policy;
 
 /// Poll interval while waiting for the sandboxed command.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -77,6 +79,7 @@ struct Cli {
     print_profile: bool,
     sets: Vec<(String, String)>,
     network: NetworkMode,
+    sandbox_policy: Option<SandboxPolicy>,
     command: Vec<String>,
 }
 
@@ -93,6 +96,7 @@ fn main() {
         print_profile,
         sets,
         network,
+        sandbox_policy,
         command,
     } = cli;
     let options = SandboxExecOptions {
@@ -100,6 +104,7 @@ fn main() {
         timeout_ms,
         extra_env: sets,
         network_mode: network,
+        sandbox_policy,
     };
     let plan = match rb_sandbox_exec::build_sandbox_exec_plan(&options, &command) {
         Ok(plan) => plan,
@@ -130,6 +135,7 @@ fn parse_cli(raw_args: &[String]) -> Result<Cli, String> {
 
     let mut workspace_root: Option<String> = None;
     let mut network: Option<NetworkMode> = None;
+    let mut sandbox_policy_json: Option<String> = None;
     let mut timeout_ms: Option<u64> = None;
     let mut print_profile = false;
     let mut sets: Vec<(String, String)> = Vec::new();
@@ -148,6 +154,10 @@ fn parse_cli(raw_args: &[String]) -> Result<Cli, String> {
                     format!("--network only supports {SUPPORTED_NETWORK_MODES:?}, got `{value}`")
                 })?;
                 replace_once(&mut network, mode, flag)?;
+            }
+            "--sandbox-policy" => {
+                let value = next_flag_value(flags, &mut index, flag)?.to_string();
+                replace_once(&mut sandbox_policy_json, value, flag)?;
             }
             "--timeout-ms" => {
                 let value = next_flag_value(flags, &mut index, flag)?;
@@ -185,12 +195,24 @@ fn parse_cli(raw_args: &[String]) -> Result<Cli, String> {
 
     let workspace_root =
         workspace_root.ok_or_else(|| "missing required flag --workspace-root <dir>".to_string())?;
+    if sandbox_policy_json.is_some() && network.is_some() {
+        // The policy fully determines network access; an explicit --network
+        // alongside it would be ambiguous.
+        return Err(
+            "--sandbox-policy and --network are mutually exclusive; the policy's              `network_access` field determines network access"
+                .to_string(),
+        );
+    }
     Ok(Cli {
         workspace_root,
         timeout_ms,
         print_profile,
         sets,
         network: network.unwrap_or(NetworkMode::Deny),
+        sandbox_policy: sandbox_policy_json
+            .as_deref()
+            .map(parse_sandbox_policy)
+            .transpose()?,
         command,
     })
 }

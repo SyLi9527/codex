@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::SandboxPolicy;
 
 /// Exit code used exclusively for runner-own failures. A sandboxed command
 /// that fails on its own forwards its real exit code instead.
@@ -63,6 +64,15 @@ impl NetworkMode {
     }
 }
 
+/// Parses a codex-native [`SandboxPolicy`] from JSON (serde tag `type`,
+/// kebab-case variants such as `workspace-write` / `read-only` /
+/// `danger-full-access`). The policy fully determines both the file-system
+/// and network projections via the shared `From<&SandboxPolicy>`
+/// implementations, so callers compose permissions exactly like codex does.
+pub fn parse_sandbox_policy(json: &str) -> Result<SandboxPolicy, String> {
+    serde_json::from_str(json).map_err(|err| format!("invalid sandbox policy JSON: {err}"))
+}
+
 /// Environment variables copied from the caller into the sandboxed process.
 const PRESERVED_ENV_KEYS: &[&str] = &["PATH", "HOME", "TMPDIR", "LANG", "SHELL"];
 /// Environment variable prefixes copied from the caller (locale settings).
@@ -87,7 +97,11 @@ pub struct SandboxExecOptions {
     /// environment. `DYLD_*` keys are rejected here as well.
     pub extra_env: Vec<(String, String)>,
     /// Network policy mode for this execution; defaults to [`NetworkMode::Deny`].
+    /// Ignored when [`Self::sandbox_policy`] is present.
     pub network_mode: NetworkMode,
+    /// Codex-native policy; when present it fully determines the file-system
+    /// and network projections and [`Self::network_mode`] is ignored.
+    pub sandbox_policy: Option<SandboxPolicy>,
 }
 
 /// Everything the runner needs to spawn the sandboxed command.
@@ -157,12 +171,24 @@ pub fn build_sandbox_exec_plan(
         return Err("missing command after `--`".to_string());
     }
     let cwd = canonical_workspace_root(&options.workspace_root)?;
-    let file_system_sandbox_policy = build_file_system_policy(&cwd)?;
+    // A codex-native policy fully determines both projections via the shared
+    // `From<&SandboxPolicy>` implementations; without one, the default is the
+    // codex workspace-write profile plus the caller's `--network` mode.
+    let (file_system_sandbox_policy, network_sandbox_policy) = match &options.sandbox_policy {
+        Some(policy) => (
+            FileSystemSandboxPolicy::from(policy),
+            NetworkSandboxPolicy::from(policy),
+        ),
+        None => (
+            build_file_system_policy(&cwd)?,
+            options.network_mode.network_sandbox_policy(),
+        ),
+    };
     let seatbelt_args = codex_sandboxing::seatbelt::create_seatbelt_command_args(
         codex_sandboxing::seatbelt::CreateSeatbeltCommandArgsParams {
             command: command.to_vec(),
             file_system_sandbox_policy: &file_system_sandbox_policy,
-            network_sandbox_policy: options.network_mode.network_sandbox_policy(),
+            network_sandbox_policy,
             sandbox_policy_cwd: cwd.as_path(),
             enforce_managed_network: false,
             managed_network: None,
@@ -381,6 +407,7 @@ mod tests {
             timeout_ms: None,
             extra_env: vec![("RB_TEST_MARKER".to_string(), "value".to_string())],
             network_mode: NetworkMode::Deny,
+            sandbox_policy: None,
         };
         let plan = build_sandbox_exec_plan(&options, &["/bin/echo".to_string(), "ok".to_string()])
             .unwrap();
@@ -408,12 +435,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_sandbox_policy_rejects_invalid_json() {
+        let error = parse_sandbox_policy("not-json").unwrap_err();
+        assert!(error.contains("invalid sandbox policy JSON"));
+        let error = parse_sandbox_policy("{\"type\":\"no-such-mode\"}").unwrap_err();
+        assert!(error.contains("invalid sandbox policy JSON"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_policy_drives_both_projections() {
+        let workspace = tempfile::tempdir().unwrap();
+        let options = SandboxExecOptions {
+            workspace_root: workspace.path().to_path_buf(),
+            timeout_ms: None,
+            extra_env: vec![],
+            network_mode: NetworkMode::Deny,
+            sandbox_policy: Some(
+                parse_sandbox_policy("{\"type\":\"workspace-write\",\"network_access\":true}")
+                    .unwrap(),
+            ),
+        };
+        let plan = build_sandbox_exec_plan(&options, &["/bin/echo".to_string(), "ok".to_string()])
+            .unwrap();
+        // Network enabled via the policy despite Deny network_mode: the
+        // policy fully determines both projections.
+        assert!(
+            plan.args[1].contains("network-outbound"),
+            "the compiled profile must allow outbound network"
+        );
+        // Full-disk read comes with the codex workspace-write projection.
+        assert!(plan.args[1].contains("(allow file-read*)"));
+    }
+
+    #[test]
     fn plan_requires_a_command() {
         let options = SandboxExecOptions {
             workspace_root: PathBuf::from("/tmp"),
             timeout_ms: None,
             extra_env: vec![],
             network_mode: NetworkMode::Deny,
+            sandbox_policy: None,
         };
         let error = build_sandbox_exec_plan(&options, &[]).unwrap_err();
         assert!(error.contains("missing command"));
@@ -426,6 +488,7 @@ mod tests {
             timeout_ms: None,
             extra_env: vec![],
             network_mode: NetworkMode::Deny,
+            sandbox_policy: None,
         };
         let error = build_sandbox_exec_plan(&options, &["/bin/echo".to_string()]).unwrap_err();
         assert!(error.contains("not accessible"));

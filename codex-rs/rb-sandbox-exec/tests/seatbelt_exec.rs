@@ -453,6 +453,85 @@ fn unsupported_network_mode_is_rejected() {
 }
 
 #[test]
+fn sandbox_policy_json_enables_network() {
+    // codex-native policy input: the JSON fully determines the projections,
+    // so network_access=true opens outbound traffic without --network.
+    let workspace = temp_workspace().unwrap();
+    let output = run_runner(&[
+        "--workspace-root",
+        workspace.path().to_str().unwrap(),
+        "--sandbox-policy",
+        "{\"type\":\"workspace-write\",\"network_access\":true}",
+        "--timeout-ms",
+        "15000",
+        "--",
+        "/usr/bin/curl",
+        "--max-time",
+        "10",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "https://pypi.org/simple/qrcode/",
+    ])
+    .unwrap();
+    let exit_code = output.status.code().expect("exit code must be set");
+    assert_eq!(
+        exit_code,
+        0,
+        "policy-driven network must allow pypi; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "200");
+}
+
+#[test]
+fn sandbox_policy_json_read_only_denies_writes() {
+    let workspace = temp_workspace().unwrap();
+    let output = run_runner(&[
+        "--workspace-root",
+        workspace.path().to_str().unwrap(),
+        "--sandbox-policy",
+        "{\"type\":\"read-only\",\"network_access\":false}",
+        "--",
+        "/usr/bin/touch",
+        workspace.path().join("denied.txt").to_str().unwrap(),
+    ])
+    .unwrap();
+    let exit_code = output.status.code().expect("exit code must be set");
+    assert_ne!(
+        exit_code, RUNNER_FAILURE_EXIT_CODE,
+        "the runner must not report its own failure for a sandboxed denial"
+    );
+    assert_ne!(exit_code, 0, "the read-only policy must deny writes");
+    assert!(
+        !workspace.path().join("denied.txt").exists(),
+        "no file may be created under a read-only policy"
+    );
+}
+
+#[test]
+fn sandbox_policy_and_network_flag_conflict() {
+    let workspace = temp_workspace().unwrap();
+    let output = run_runner(&[
+        "--workspace-root",
+        workspace.path().to_str().unwrap(),
+        "--sandbox-policy",
+        "{\"type\":\"workspace-write\",\"network_access\":true}",
+        "--network",
+        "deny",
+        "--",
+        "/bin/echo",
+        "must-not-run",
+    ])
+    .unwrap();
+    assert_eq!(output.status.code(), Some(RUNNER_FAILURE_EXIT_CODE));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("RB_SANDBOX_UNAVAILABLE:"));
+    assert!(stderr.contains("mutually exclusive"));
+}
+
+#[test]
 fn network_mode_enabled_allows_outbound() {
     // codex workspace-write `network_access = true` parity: `--network
     // enabled` swaps the compiled policy to one that allows outbound traffic.
